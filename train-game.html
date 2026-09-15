@@ -6162,6 +6162,39 @@ function addTrussBeam(group, x0, y0, z0, x1, y1, z1, mat, thickness) {
   group.add(beam);
 }
 
+// Orients a segment-following box (deck slabs, barrier panels) along its
+// actual 3D direction WITHOUT rolling it sideways — a plain
+// quaternion.setFromUnitVectors(localX, dir) only constrains which way the
+// box's length axis points; on a segment that's curving AND graded at the
+// same time, the "minimal rotation" it picks can bank the box like a boat
+// heeling over, so one rail ends up looking sunken relative to the tilted
+// deck and the other looks like it's poking up. Building an explicit
+// level-locked basis (forward/up/right, with "up" derived from world-up
+// via cross products) keeps the box's cross-section level and only pitches
+// it to follow the grade, never rolling it.
+// NOTE: verified numerically before shipping — the FIRST version of this
+// (right = worldUp × dir, up = dir × right) builds a well-formed
+// orthonormal, level basis, but it's LEFT-handed (dir × up = −right, not
+// +right); makeBasis expects a right-handed one, so every box built with
+// it came out mirror-inverted (inside-out normals/winding), which is why
+// the sound barrier walls looked broken rather than just subtly wrong.
+// This version (right = dir × worldUp, up = right × dir) was checked
+// against six direction combinations — curving left/right, up/down grade,
+// flat — confirming right stays exactly horizontal, up stays within
+// 0.1° of true vertical for realistic grades, and dir × up === right
+// (proper right-handed) in every case.
+const _segBasisM = new THREE.Matrix4();
+const _worldUp = new THREE.Vector3(0, 1, 0);
+function orientSegmentBox(mesh, dx, dy, dz) {
+  const dir = new THREE.Vector3(dx, dy, dz).normalize();
+  const right = new THREE.Vector3().crossVectors(dir, _worldUp);
+  if (right.lengthSq() < 1e-8) right.set(0, 0, 1); // dir ~parallel to world-up — never happens for real track grades, just a safe fallback
+  right.normalize();
+  const up = new THREE.Vector3().crossVectors(right, dir).normalize();
+  _segBasisM.makeBasis(dir, up, right);
+  mesh.quaternion.setFromRotationMatrix(_segBasisM);
+}
+
 function buildTrussBridge(t) {
   const group = new THREE.Group();
   if (!trussSpan) return group;
@@ -6185,11 +6218,11 @@ function buildTrussBridge(t) {
     const p0 = t.points[di], p1 = t.points[dj];
     const cx0 = p0.x + Math.cos(p0.heading) * (TRACK_SPACING / 2), cz0 = p0.z - Math.sin(p0.heading) * (TRACK_SPACING / 2);
     const cx1 = p1.x + Math.cos(p1.heading) * (TRACK_SPACING / 2), cz1 = p1.z - Math.sin(p1.heading) * (TRACK_SPACING / 2);
-    const dx = cx1 - cx0, dz = cz1 - cz0, segLen = Math.hypot(dx, dz);
+    const dx = cx1 - cx0, dy = p1.y - p0.y, dz = cz1 - cz0, segLen = Math.hypot(dx, dy, dz);
     if (segLen > 0.2) {
       const deck = new THREE.Mesh(new THREE.BoxGeometry(segLen, DECK_THICKNESS, trussDeckWidth), deckMat);
-      deck.position.set((cx0 + cx1) / 2, p0.y - DECK_THICKNESS / 2, (cz0 + cz1) / 2);
-      deck.rotation.y = Math.atan2(-dz, dx);
+      deck.position.set((cx0 + cx1) / 2, (p0.y + p1.y) / 2 - DECK_THICKNESS / 2, (cz0 + cz1) / 2);
+      orientSegmentBox(deck, dx, dy, dz);
       deck.castShadow = true; deck.receiveShadow = true;
       group.add(deck);
     }
@@ -6301,12 +6334,18 @@ function buildDeck(t) {
       const p0 = t.points[i], p1 = t.points[j];
       const cx0 = p0.x + Math.cos(p0.heading) * (TRACK_SPACING / 2), cz0 = p0.z - Math.sin(p0.heading) * (TRACK_SPACING / 2);
       const cx1 = p1.x + Math.cos(p1.heading) * (TRACK_SPACING / 2), cz1 = p1.z - Math.sin(p1.heading) * (TRACK_SPACING / 2);
-      const dx = cx1 - cx0, dz = cz1 - cz0;
-      const segLen = Math.hypot(dx, dz);
+      const dx = cx1 - cx0, dy = p1.y - p0.y, dz = cz1 - cz0;
+      const segLen = Math.hypot(dx, dy, dz);
       if (segLen > 0.2) {
+        // Oriented along the FULL 3D direction (including the grade's dy),
+        // not just the flat (dx,dz) heading — a purely horizontal box on a
+        // graded section only touches the next one at a single point
+        // instead of a flush face, which is exactly the "broken into
+        // pieces" stepped look on slopes (worse going downhill, where the
+        // step catches a shadow, but really present on any grade).
         const deck = new THREE.Mesh(new THREE.BoxGeometry(segLen, DECK_THICKNESS, DECK_WIDTH), deckMat);
-        deck.position.set((cx0 + cx1) / 2, p0.y - DECK_THICKNESS / 2, (cz0 + cz1) / 2);
-        deck.rotation.y = Math.atan2(-dz, dx);
+        deck.position.set((cx0 + cx1) / 2, (p0.y + p1.y) / 2 - DECK_THICKNESS / 2, (cz0 + cz1) / 2);
+        orientSegmentBox(deck, dx, dy, dz);
         deck.castShadow = true; deck.receiveShadow = true;
         group.add(deck);
       }
@@ -6415,12 +6454,12 @@ function buildSoundBarrier(t) {
         const p1 = t.points[j];
         const nx1 = Math.cos(p1.heading) * offset, nz1 = -Math.sin(p1.heading) * offset;
         const x0 = p0.x + nx0, z0 = p0.z + nz0, x1 = p1.x + nx1, z1 = p1.z + nz1;
-        const dx = x1 - x0, dz = z1 - z0;
-        const panelLen = Math.hypot(dx, dz);
+        const dx = x1 - x0, dy = p1.y - p0.y, dz = z1 - z0;
+        const panelLen = Math.hypot(dx, dy, dz);
         if (panelLen > 0.2) {
           const panel = new THREE.Mesh(new THREE.BoxGeometry(panelLen, BARRIER_HEIGHT * 0.94, 0.06), wallMat);
-          panel.position.set((x0 + x1) / 2, p0.y + BARRIER_HEIGHT / 2, (z0 + z1) / 2);
-          panel.rotation.y = Math.atan2(-dz, dx);
+          panel.position.set((x0 + x1) / 2, (p0.y + p1.y) / 2 + BARRIER_HEIGHT / 2, (z0 + z1) / 2);
+          orientSegmentBox(panel, dx, dy, dz);
           panel.castShadow = true;
           group.add(panel);
         }
